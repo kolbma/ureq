@@ -1,3 +1,34 @@
+# Unreleased
+
+# 2.9.5
+
+## Fixed
+
+  * Update deps (`cookie` 0.18, `cookie_store` 0.21, unpin `url`). (#722)
+
+# 2.9.4
+
+## Fixed
+
+  * MSRV 1.61 with CI tests
+
+# 2.9.3
+
+## Fixed
+
+  * docs.rs docs
+
+# 2.9.2
+
+## Added
+
+  * Replace dependency on httpbin.org for tests/doc-tests. (#703)
+
+## Fixed
+
+  * Remove Header struct that never should have been exported. (#696)
+  * Update deps (rustls 0.22) (#690)
+
 # 2.9.1
 
 ## Fixed
