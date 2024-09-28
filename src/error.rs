@@ -1,503 +1,239 @@
-use url::{ParseError, Url};
-
-use std::error;
-use std::fmt::{self, Display};
 use std::io;
 
-use crate::Response;
+use thiserror::Error;
 
-/// An error that may occur when processing a [Request](crate::Request).
-///
-/// This can represent connection-level errors (e.g. connection refused),
-/// protocol-level errors (malformed response), or status code errors
-/// (e.g. 404 Not Found). Status code errors are represented by the
-/// [Status](Error::Status) enum variant, while connection-level and
-/// protocol-level errors are represented by the [Transport](Error::Transport)
-/// enum variant. You can use a match statement to extract a Response
-/// from a `Status` error. For instance, you may want to read the full
-/// body of a response because you expect it to contain a useful error
-/// message. Or you may want to handle certain error code responses
-/// differently.
-///
-/// # Examples
-///
-/// Example of matching out all unexpected server status codes.
-///
-/// ```no_run
-/// use ureq::Error;
-///
-/// match ureq::get("http://mypage.example.com/").call() {
-///     Ok(response) => { /* it worked */},
-///     Err(Error::Status(code, response)) => {
-///         /* the server returned an unexpected status
-///            code (such as 400, 500 etc) */
-///     }
-///     Err(_) => { /* some kind of io/transport error */ }
-/// }
-/// ```
-///
-/// An example of a function that handles HTTP 429 and 500 errors differently
-/// than other errors. They get retried after a suitable delay, up to 4 times.
-///
-/// ```
-/// use std::{result::Result, time::Duration, thread};
-/// use ureq::{Response, Error, Error::Status};
-/// # fn main(){ ureq::is_test(true); get_response( "http://httpbin.org/status/500" ); }
-///
-/// fn get_response(url: &str) -> Result<Response, Error> {
-///     for _ in 1..4 {
-///         match ureq::get(url).call() {
-///             Err(Status(503, r)) | Err(Status(429, r)) => {
-///                 let retry: Option<u64> = r.header("retry-after")
-///                     .and_then(|h| h.parse().ok());
-///                 let retry = retry.unwrap_or(5);
-///                 eprintln!("{} for {}, retry in {}", r.status(), r.get_url(), retry);
-///                 thread::sleep(Duration::from_secs(retry));
-///             }
-///             result => return result,
-///         };
-///     }
-///     // Ran out of retries; try one last time and return whatever result we get.
-///     ureq::get(url).call()
-/// }
-/// ```
-///
-/// If you'd like to treat all status code errors as normal, successful responses,
-/// you can use [OrAnyStatus::or_any_status] like this:
-///
-/// ```
-/// use ureq::Error::Status;
-/// # fn main() -> std::result::Result<(), ureq::Transport> {
-/// # ureq::is_test(true);
-/// use ureq::OrAnyStatus;
-///
-/// let resp = ureq::get("http://example.com/")
-///   .call()
-///   .or_any_status()?;
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Debug)]
+use crate::Timeout;
+
+/// Errors from ureq.
+#[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
-    /// A response was successfully received but had status code >= 400.
-    /// Values are (status_code, Response).
-    Status(u16, Response),
-    /// There was an error making the request or receiving the response.
-    Transport(Transport),
-}
-
-impl Error {
-    /// Optionally turn this error into an underlying `Transport`.
+    /// When [`AgentConfig::http_status_as_error`](crate::AgentConfig::http_status_as_error) is true,
+    /// 4xx and 5xx response status codes are translated to this error.
     ///
-    /// `None` if the underlying error is `Error::Status`.
-    pub fn into_transport(self) -> Option<Transport> {
-        match self {
-            Error::Status(_, _) => None,
-            Error::Transport(t) => Some(t),
-        }
-    }
+    /// This is the default behavior.
+    #[error("http status: {0}")]
+    StatusCode(u16),
 
-    /// Optionally turn this error into an underlying `Response`.
+    /// Errors arising from the http-crate.
     ///
-    /// `None` if the underlying error is `Error::Transport`.
-    pub fn into_response(self) -> Option<Response> {
-        match self {
-            Error::Status(_, r) => Some(r),
-            Error::Transport(_) => None,
-        }
-    }
-}
+    /// These errors happen for things like invalid characters in header names.
+    #[error("http: {0}")]
+    Http(#[from] http::Error),
 
-/// Error that is not a status code error. For instance, DNS name not found,
-/// connection refused, or malformed response.
-///
-/// * [`Transport::kind()`] provides a classification (same as for [`Error::kind`]).
-/// * [`Transport::message()`] might vary for the same classification to give more context.
-/// * [`Transport::source()`](std::error::Error::source) holds the underlying error with even more details.
-///
-/// ```
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use ureq::ErrorKind;
-/// use std::error::Error;
-/// use url::ParseError;
-///
-/// let result = ureq::get("broken/url").call();
-/// let error = result.unwrap_err().into_transport().unwrap();
-///
-/// // the display trait is a combo of the underlying classifications
-/// assert_eq!(error.to_string(),
-///     "Bad URL: failed to parse URL: RelativeUrlWithoutBase: relative URL without a base");
-///
-/// // classification
-/// assert_eq!(error.kind(), ErrorKind::InvalidUrl);
-/// assert_eq!(error.kind().to_string(), "Bad URL");
-///
-/// // higher level message
-/// assert_eq!(error.message(), Some("failed to parse URL: RelativeUrlWithoutBase"));
-///
-/// // boxed underlying error
-/// let source = error.source().unwrap();
-/// // downcast to original error
-/// let downcast: &ParseError = source.downcast_ref().unwrap();
-///
-/// assert_eq!(downcast.to_string(), "relative URL without a base");
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Debug)]
-pub struct Transport {
-    kind: ErrorKind,
-    message: Option<String>,
-    url: Option<Url>,
-    source: Option<Box<dyn error::Error + Send + Sync + 'static>>,
-}
+    /// Error if the URI is missing scheme or host.
+    #[error("bad uri: {0}")]
+    BadUri(String),
 
-impl Transport {
-    /// The type of error that happened while processing the request.
-    pub fn kind(&self) -> ErrorKind {
-        self.kind
-    }
-
-    /// Higher level error details, if there are any.
-    pub fn message(&self) -> Option<&str> {
-        self.message.as_deref()
-    }
-
-    /// The url that failed. This can be interesting in cases of redirect where
-    /// the original url worked, but a later redirected to url fails.
-    pub fn url(&self) -> Option<&Url> {
-        self.url.as_ref()
-    }
-}
-
-/// Extension to [`Result<Response, Error>`] for handling all status codes as [`Response`].
-pub trait OrAnyStatus {
-    /// Ergonomic helper for handling all status codes as [`Response`].
+    /// An HTTP/1.1 protocol error.
     ///
-    /// By default, ureq returns non-2xx responses as [`Error::Status`]. This
-    /// helper is for handling all responses as [`Response`], regardless
-    /// of status code.
+    /// This can happen if the remote server ends incorrect HTTP data like
+    /// missing version or invalid chunked transfer.
+    #[error("protocol: {0}")]
+    Protocol(#[from] hoot::Error),
+
+    /// Error in io such as the TCP socket.
+    #[error("io: {0}")]
+    Io(io::Error),
+
+    /// Error raised if the request hits any configured timeout.
     ///
-    /// ```
-    /// # ureq::is_test(true);
-    /// # fn main() -> Result<(), ureq::Transport> {
-    /// // Bring trait into context.
-    /// use ureq::OrAnyStatus;
+    /// By default no timeouts are set, which means this error can't happen.
+    #[error("timeout: {0}")]
+    Timeout(Timeout),
+
+    /// Error when resolving a hostname fails.
+    #[error("host not found")]
+    HostNotFound,
+
+    /// A redirect failed.
     ///
-    /// let response = ureq::get("http://httpbin.org/status/500")
-    ///     .call()
-    ///     // Transport errors, such as DNS or connectivity problems
-    ///     // must still be dealt with as `Err`.
-    ///     .or_any_status()?;
-    ///
-    /// assert_eq!(response.status(), 500);
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn or_any_status(self) -> Result<Response, Transport>;
-}
+    /// This happens when ureq encounters a redirect when sending a request body
+    /// such as a POST request, and receives a 307/308 response. ureq refuses to
+    /// redirect the POST body and instead raises this error.
+    #[error("redirect failed")]
+    RedirectFailed,
 
-impl OrAnyStatus for Result<Response, Error> {
-    fn or_any_status(self) -> Result<Response, Transport> {
-        match self {
-            Ok(response) => Ok(response),
-            Err(Error::Status(_, response)) => Ok(response),
-            Err(Error::Transport(transport)) => Err(transport),
-        }
-    }
-}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Status(status, response) => {
-                write!(f, "{}: status code {}", response.get_url(), status)?;
-                if let Some(original) = response.history.first() {
-                    write!(f, " (redirected from {})", original)?;
-                }
-            }
-            Error::Transport(err) => {
-                write!(f, "{}", err)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Display for Transport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(url) = &self.url {
-            write!(f, "{}: ", url)?;
-        }
-        write!(f, "{}", self.kind)?;
-        if let Some(message) = &self.message {
-            write!(f, ": {}", message)?;
-        }
-        if let Some(source) = &self.source {
-            write!(f, ": {}", source)?;
-        }
-        Ok(())
-    }
-}
-
-impl error::Error for Error {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match &self {
-            Error::Transport(Transport {
-                source: Some(s), ..
-            }) => Some(s.as_ref()),
-            _ => None,
-        }
-    }
-}
-
-impl error::Error for Transport {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|s| s.as_ref() as &(dyn error::Error + 'static))
-    }
-}
-
-impl Error {
-    pub(crate) fn new(kind: ErrorKind, message: Option<String>) -> Self {
-        Error::Transport(Transport {
-            kind,
-            message,
-            url: None,
-            source: None,
-        })
-    }
-
-    pub(crate) fn url(self, url: Url) -> Self {
-        if let Error::Transport(mut e) = self {
-            e.url = Some(url);
-            Error::Transport(e)
-        } else {
-            self
-        }
-    }
-
-    pub(crate) fn src(self, e: impl error::Error + Send + Sync + 'static) -> Self {
-        if let Error::Transport(mut oe) = self {
-            oe.source = Some(Box::new(e));
-            Error::Transport(oe)
-        } else {
-            self
-        }
-    }
-
-    /// The type of this error.
-    ///
-    /// ```
-    /// # ureq::is_test(true);
-    /// let err = ureq::get("http://httpbin.org/status/500")
-    ///     .call().unwrap_err();
-    /// assert_eq!(err.kind(), ureq::ErrorKind::HTTP);
-    /// ```
-    pub fn kind(&self) -> ErrorKind {
-        match self {
-            Error::Status(_, _) => ErrorKind::HTTP,
-            Error::Transport(Transport { kind: k, .. }) => *k,
-        }
-    }
-
-    /// Return true iff the error was due to a connection closing.
-    pub(crate) fn connection_closed(&self) -> bool {
-        if self.kind() != ErrorKind::Io {
-            return false;
-        }
-        let other_err = match self {
-            Error::Status(_, _) => return false,
-            Error::Transport(e) => e,
-        };
-        let source = match other_err.source.as_ref() {
-            Some(e) => e,
-            None => return false,
-        };
-        let ioe: &io::Error = match source.downcast_ref() {
-            Some(e) => e,
-            None => return false,
-        };
-        match ioe.kind() {
-            io::ErrorKind::ConnectionAborted => true,
-            io::ErrorKind::ConnectionReset => true,
-            _ => false,
-        }
-    }
-}
-
-/// One of the types of error the can occur when processing a Request.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum ErrorKind {
-    /// The url could not be understood.
-    InvalidUrl,
-    /// The url scheme could not be understood.
-    UnknownScheme,
-    /// DNS lookup failed.
-    Dns,
-    /// Insecure request attempted with https only set
-    InsecureRequestHttpsOnly,
-    /// Connection to server failed.
-    ConnectionFailed,
-    /// Too many redirects.
-    TooManyRedirects,
-    /// A status line we don't understand `HTTP/1.1 200 OK`.
-    BadStatus,
-    /// A header line that couldn't be parsed.
-    BadHeader,
-    /// Some unspecified `std::io::Error`.
-    Io,
-    /// Proxy information was not properly formatted
+    /// Error when creating proxy settings.
+    #[error("invalid proxy url")]
     InvalidProxyUrl,
-    /// Proxy could not connect
-    ProxyConnect,
-    /// Incorrect credentials for proxy
-    ProxyUnauthorized,
-    /// HTTP status code indicating an error (e.g. 4xx, 5xx)
-    /// Read the inner response body for details and to return
-    /// the connection to the pool.
-    HTTP,
+
+    /// A connection failed.
+    #[error("connection failed")]
+    ConnectionFailed,
+
+    /// A send body (Such as `&str`) is larger than the `content-length` header.
+    #[error("the response body is larger than request limit: {0}")]
+    BodyExceedsLimit(u64),
+
+    /// Some error with TLS.
+    #[cfg(feature = "_tls")]
+    #[error("{0}")]
+    Tls(&'static str),
+
+    /// Error in reading PEM certificates/private keys.
+    ///
+    /// *Note:* The wrapped error struct is not considered part of ureq API.
+    /// Breaking changes in that struct will not be reflected in ureq
+    /// major versions.
+    #[cfg(feature = "_tls")]
+    #[error("PEM: {0:?}")]
+    Pem(rustls_pemfile::Error),
+
+    /// An error originating in Rustls.
+    ///
+    /// *Note:* The wrapped error struct is not considered part of ureq API.
+    /// Breaking changes in that struct will not be reflected in ureq
+    /// major versions.
+    #[cfg(feature = "rustls")]
+    #[error("rustls: {0}")]
+    Rustls(#[from] rustls::Error),
+
+    /// An error originating in Native-TLS.
+    ///
+    /// *Note:* The wrapped error struct is not considered part of ureq API.
+    /// Breaking changes in that struct will not be reflected in ureq
+    /// major versions.
+    #[cfg(feature = "native-tls")]
+    #[error("native-tls: {0}")]
+    NativeTls(#[from] native_tls::Error),
+
+    /// An error providing DER encoded certificates or private keys to Native-TLS.
+    ///
+    /// *Note:* The wrapped error struct is not considered part of ureq API.
+    /// Breaking changes in that struct will not be reflected in ureq
+    /// major versions.
+    #[cfg(feature = "native-tls")]
+    #[error("der: {0}")]
+    Der(#[from] der::Error),
+
+    /// An error with the cookies.
+    ///
+    /// *Note:* The wrapped error struct is not considered part of ureq API.
+    /// Breaking changes in that struct will not be reflected in ureq
+    /// major versions.
+    #[cfg(feature = "cookies")]
+    #[error("cookie: {0}")]
+    Cookie(#[from] cookie_store::CookieError),
+
+    /// An error parsing a cookie value.
+    #[cfg(feature = "cookies")]
+    #[error("{0}")]
+    CookieValue(&'static str),
+
+    /// An error in the cookie store.
+    ///
+    /// *Note:* The wrapped error struct is not considered part of ureq API.
+    /// Breaking changes in that struct will not be reflected in ureq
+    /// major versions.
+    #[cfg(feature = "cookies")]
+    #[error("cookie: {0}")]
+    CookieJar(#[from] cookie_store::Error),
+
+    /// An unrecognised character set.
+    #[cfg(feature = "charset")]
+    #[error("unknown character set: {0}")]
+    UnknownCharset(String),
+
+    /// The setting [`AgentConfig::https_only`](crate::AgentConfig::https_only) is true and
+    /// the URI is not https.
+    #[error("configured for https only: {0}")]
+    RequireHttpsOnly(String),
+
+    /// The response header, from status up until body, is too big.
+    ///
+    #[error("response header is too big: {0} > {1}")]
+    LargeResponseHeader(usize, usize),
+
+    /// Body decompression failed (gzip or brotli).
+    #[error("{0} decompression failed: {1}")]
+    #[cfg(any(feature = "gzip", feature = "brotli"))]
+    Decompress(&'static str, io::Error),
+
+    /// Serde JSON error.
+    #[cfg(feature = "json")]
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// Attempt to connect to a CONNECT proxy failed.
+    #[error("CONNECT proxy failed: {0}")]
+    ConnectProxyFailed(String),
+
+    /// hoot made no progress and there is no more input to read.
+    ///
+    /// We should never see this value.
+    #[doc(hidden)]
+    #[error("body data reading stalled")]
+    BodyStalled,
 }
 
-impl ErrorKind {
-    #[allow(clippy::wrong_self_convention)]
-    #[allow(clippy::new_ret_no_self)]
-    pub(crate) fn new(self) -> Error {
-        Error::new(self, None)
+impl Error {
+    /// Convert the error into a [`std::io::Error`].
+    ///
+    /// If the error is [`Error::Io`], we unpack the error. In othe cases we make
+    /// an `std::io::ErrorKind::Other`.
+    pub fn into_io(self) -> io::Error {
+        if let Self::Io(e) = self {
+            e
+        } else {
+            io::Error::new(io::ErrorKind::Other, self)
+        }
     }
 
-    pub(crate) fn msg(self, s: impl Into<String>) -> Error {
-        Error::new(self, Some(s.into()))
-    }
-}
-
-impl From<Response> for Error {
-    fn from(resp: Response) -> Error {
-        Error::Status(resp.status(), resp)
+    pub(crate) fn disconnected() -> Error {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "Peer disconnected").into()
     }
 }
 
 impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Error {
-        ErrorKind::Io.new().src(err)
-    }
-}
+    fn from(e: io::Error) -> Self {
+        let is_wrapped_ureq_error = e.get_ref().map(|x| x.is::<Error>()).unwrap_or(false);
 
-impl From<Transport> for Error {
-    fn from(err: Transport) -> Error {
-        Error::Transport(err)
-    }
-}
-
-impl From<ParseError> for Error {
-    fn from(err: ParseError) -> Self {
-        ErrorKind::InvalidUrl
-            .msg(format!("failed to parse URL: {:?}", err))
-            .src(err)
-    }
-}
-
-impl fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            ErrorKind::InvalidUrl => write!(f, "Bad URL"),
-            ErrorKind::UnknownScheme => write!(f, "Unknown Scheme"),
-            ErrorKind::Dns => write!(f, "Dns Failed"),
-            ErrorKind::InsecureRequestHttpsOnly => {
-                write!(f, "Insecure request attempted with https_only set")
-            }
-            ErrorKind::ConnectionFailed => write!(f, "Connection Failed"),
-            ErrorKind::TooManyRedirects => write!(f, "Too Many Redirects"),
-            ErrorKind::BadStatus => write!(f, "Bad Status"),
-            ErrorKind::BadHeader => write!(f, "Bad Header"),
-            ErrorKind::Io => write!(f, "Network Error"),
-            ErrorKind::InvalidProxyUrl => write!(f, "Malformed proxy"),
-            ErrorKind::ProxyConnect => write!(f, "Proxy failed to connect"),
-            ErrorKind::ProxyUnauthorized => write!(f, "Provided proxy credentials are incorrect"),
-            ErrorKind::HTTP => write!(f, "HTTP status error"),
+        if is_wrapped_ureq_error {
+            // unwraps are ok, see above.
+            let boxed = e.into_inner().unwrap();
+            let ureq = boxed.downcast::<Error>().unwrap();
+            *ureq
+        } else {
+            Error::Io(e)
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
+
     use super::*;
 
     #[test]
-    fn status_code_error() {
-        let mut response = Response::new(404, "NotFound", "").unwrap();
-        response.set_url("http://example.org/".parse().unwrap());
-        let err = Error::Status(response.status(), response);
-
-        assert_eq!(err.to_string(), "http://example.org/: status code 404");
-    }
-
-    #[test]
+    #[cfg(feature = "_test")]
     fn status_code_error_redirect() {
-        use crate::{get, test};
-
-        test::set_handler("/redirect_a", |unit| {
-            assert_eq!(unit.method, "GET");
-            test::make_response(
-                302,
-                "Go here",
-                vec!["Location: test://example.edu/redirect_b"],
-                vec![],
-            )
-        });
-        test::set_handler("/redirect_b", |unit| {
-            assert_eq!(unit.method, "GET");
-            test::make_response(
-                302,
-                "Go here",
-                vec!["Location: http://example.com/status/500"],
-                vec![],
-            )
-        });
-
-        let err = get("test://example.org/redirect_a").call().unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::HTTP, "{:?}", err);
-        assert_eq!(
-        err.to_string(),
-        "http://example.com/status/500: status code 500 (redirected from test://example.org/redirect_a)"
-    );
-    }
-
-    #[test]
-    fn io_error() {
-        let ioe = io::Error::new(io::ErrorKind::TimedOut, "too slow");
-        let mut err = Error::new(ErrorKind::Io, Some("oops".to_string())).src(ioe);
-
-        err = err.url("http://example.com/".parse().unwrap());
-        assert_eq!(
-            err.to_string(),
-            "http://example.com/: Network Error: oops: too slow"
+        use crate::test::init_test_log;
+        use crate::transport::set_handler;
+        init_test_log();
+        set_handler(
+            "/redirect_a",
+            302,
+            &[("Location", "http://example.edu/redirect_b")],
+            &[],
         );
-    }
-
-    #[test]
-    fn connection_closed() {
-        let ioe = io::Error::new(io::ErrorKind::ConnectionReset, "connection reset");
-        let err = ErrorKind::Io.new().src(ioe);
-        assert!(err.connection_closed());
-
-        let ioe = io::Error::new(io::ErrorKind::ConnectionAborted, "connection aborted");
-        let err = ErrorKind::Io.new().src(ioe);
-        assert!(err.connection_closed());
-    }
-
-    #[test]
-    fn error_implements_send_and_sync() {
-        let _error: Box<dyn Send> = Box::new(Error::new(ErrorKind::Io, None));
-        let _error: Box<dyn Sync> = Box::new(Error::new(ErrorKind::Io, None));
+        set_handler(
+            "/redirect_b",
+            302,
+            &[("Location", "http://example.com/status/500")],
+            &[],
+        );
+        set_handler("/status/500", 500, &[], &[]);
+        let err = crate::get("http://example.org/redirect_a")
+            .call()
+            .unwrap_err();
+        assert!(matches!(err, Error::StatusCode(500)));
     }
 
     #[test]
     fn ensure_error_size() {
         // This is platform dependent, so we can't be too strict or precise.
         let size = std::mem::size_of::<Error>();
-        println!("Error size: {}", size);
-        assert!(size < 500); // 344 on Macbook M1
+        assert!(size < 100); // 40 on Macbook M1
     }
 }

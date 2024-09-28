@@ -1,81 +1,113 @@
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
+use hoot::parser::try_parse_response;
+use std::convert::{TryFrom, TryInto};
+use std::fmt;
+use std::io::Write;
 
-use crate::{
-    error::{Error, ErrorKind},
-    Response,
-};
+use http::{StatusCode, Uri};
+
+use crate::transport::{ConnectionDetails, Connector, Transport, TransportAdapter};
+use crate::util::{AuthorityExt, DebugUri, SchemeExt, UriExt};
+use crate::Error;
 
 /// Proxy protocol
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Proto {
-    HTTP,
-    SOCKS4,
-    SOCKS4A,
-    SOCKS5,
+#[non_exhaustive]
+pub(crate) enum Proto {
+    Http,
+    Https,
+    Socks4,
+    Socks4A,
+    Socks5,
 }
 
-/// Proxy server definition
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+impl Proto {
+    pub fn default_port(&self) -> u16 {
+        match self {
+            Proto::Http => 80,
+            Proto::Https => 443,
+            Proto::Socks4 | Proto::Socks4A | Proto::Socks5 => 1080,
+        }
+    }
+
+    pub fn is_socks(&self) -> bool {
+        matches!(self, Self::Socks4 | Self::Socks4A | Self::Socks5)
+    }
+
+    pub(crate) fn is_connect(&self) -> bool {
+        matches!(self, Self::Http | Self::Https)
+    }
+}
+
+/// Proxy server settings
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct Proxy {
-    pub(crate) server: String,
-    pub(crate) port: u32,
-    pub(crate) user: Option<String>,
-    pub(crate) password: Option<String>,
-    pub(crate) proto: Proto,
+    proto: Proto,
+    uri: Uri,
+    from_env: bool,
 }
 
 impl Proxy {
-    fn parse_creds<S: AsRef<str>>(
-        creds: &Option<S>,
-    ) -> Result<(Option<String>, Option<String>), Error> {
-        match creds {
-            Some(creds) => {
-                let mut parts = creds
-                    .as_ref()
-                    .splitn(2, ':')
-                    .collect::<Vec<&str>>()
-                    .into_iter();
-
-                if parts.len() != 2 {
-                    Err(ErrorKind::InvalidProxyUrl.new())
-                } else {
-                    Ok((
-                        parts.next().map(String::from),
-                        parts.next().map(String::from),
-                    ))
-                }
-            }
-            None => Ok((None, None)),
-        }
+    /// Create a proxy from a uri.
+    ///
+    /// # Arguments:
+    ///
+    /// * `proxy` - a str of format `<protocol>://<user>:<password>@<host>:port` . All parts
+    ///    except host are optional.
+    ///
+    /// ###  Protocols
+    ///
+    /// * `http`: HTTP CONNECT proxy
+    /// * `https`: HTTPS CONNECT proxy (requires a TLS provider)
+    /// * `socks4`: SOCKS4 (requires **socks-proxy** feature)
+    /// * `socks4a`: SOCKS4A (requires **socks-proxy** feature)
+    /// * `socks5` and `socks`: SOCKS5 (requires **socks-proxy** feature)
+    ///
+    /// # Examples proxy formats
+    ///
+    /// * `http://127.0.0.1:8080`
+    /// * `socks5://john:smith@socks.google.com`
+    /// * `john:smith@socks.google.com:8000`
+    /// * `localhost`
+    pub fn new(proxy: &str) -> Result<Self, Error> {
+        Self::new_with_flag(proxy, false)
     }
 
-    fn parse_address<S: AsRef<str>>(host: &Option<S>) -> Result<(String, Option<u32>), Error> {
-        match host {
-            Some(host) => {
-                let mut parts = host.as_ref().split(':').collect::<Vec<&str>>().into_iter();
-                let host = parts
-                    .next()
-                    .ok_or_else(|| ErrorKind::InvalidProxyUrl.new())?;
-                let port = parts.next();
-                Ok((
-                    String::from(host),
-                    port.and_then(|port| port.parse::<u32>().ok()),
-                ))
-            }
-            None => Err(ErrorKind::InvalidProxyUrl.new()),
-        }
+    fn new_with_flag(proxy: &str, from_env: bool) -> Result<Self, Error> {
+        let uri = proxy.parse::<Uri>().unwrap();
+
+        // The uri must have an authority part (with the host), or
+        // it is invalid.
+        let _ = uri.authority().ok_or(Error::InvalidProxyUrl)?;
+
+        // The default protocol is Proto::HTTP
+        let scheme = uri.scheme_str().unwrap_or("http");
+        let proto = scheme.try_into()?;
+
+        Ok(Self {
+            proto,
+            uri,
+            from_env,
+        })
     }
 
-    pub(crate) fn use_authorization(&self) -> bool {
-        self.user.is_some() && self.password.is_some()
-    }
-
-    pub(crate) fn try_from_system() -> Option<Self> {
+    /// Read proxy settings from environment variables.
+    ///
+    /// The environment variable is expected to contain a proxy URI. The following
+    /// environment variables are attempted:
+    ///
+    /// * `ALL_PROXY`
+    /// * `HTTPS_PROXY`
+    /// * `HTTP_PROXY`
+    ///
+    /// Returns `None` if no environment variable is set or the URI is invalid.
+    pub fn try_from_env() -> Option<Self> {
         macro_rules! try_env {
             ($($env:literal),+) => {
                 $(
                     if let Ok(env) = std::env::var($env) {
-                        if let Ok(proxy) = Self::new(env) {
+                        if let Ok(proxy) = Self::new_with_flag(&env, true) {
                             return Some(proxy);
                         }
                     }
@@ -94,111 +126,173 @@ impl Proxy {
         None
     }
 
-    /// Create a proxy from a format string.
-    /// # Arguments:
-    /// * `proxy` - a str of format `<protocol>://<user>:<password>@<host>:port` . All parts except host are optional.
-    /// # Protocols
-    /// * `http`: HTTP
-    /// * `socks4`: SOCKS4 (requires socks feature)
-    /// * `socks4a`: SOCKS4A (requires socks feature)
-    /// * `socks5` and `socks`: SOCKS5 (requires socks feature)
-    /// # Examples
-    /// * `http://127.0.0.1:8080`
-    /// * `socks5://john:smith@socks.google.com`
-    /// * `john:smith@socks.google.com:8000`
-    /// * `localhost`
-    pub fn new<S: AsRef<str>>(proxy: S) -> Result<Self, Error> {
-        let mut proxy = proxy.as_ref();
-
-        while proxy.ends_with('/') {
-            proxy = &proxy[..(proxy.len() - 1)];
-        }
-
-        let mut proxy_parts = proxy.splitn(2, "://").collect::<Vec<&str>>().into_iter();
-
-        let proto = if proxy_parts.len() == 2 {
-            match proxy_parts.next() {
-                Some("http") => Proto::HTTP,
-                Some("socks4") => Proto::SOCKS4,
-                Some("socks4a") => Proto::SOCKS4A,
-                Some("socks") => Proto::SOCKS5,
-                Some("socks5") => Proto::SOCKS5,
-                _ => return Err(ErrorKind::InvalidProxyUrl.new()),
-            }
-        } else {
-            Proto::HTTP
-        };
-
-        let remaining_parts = proxy_parts.next();
-        if remaining_parts.is_none() {
-            return Err(ErrorKind::InvalidProxyUrl.new());
-        }
-
-        let mut creds_server_port_parts = remaining_parts
-            .unwrap()
-            .rsplitn(2, '@')
-            .collect::<Vec<&str>>()
-            .into_iter()
-            .rev();
-
-        let (user, password) = if creds_server_port_parts.len() == 2 {
-            Proxy::parse_creds(&creds_server_port_parts.next())?
-        } else {
-            (None, None)
-        };
-
-        let (server, port) = Proxy::parse_address(&creds_server_port_parts.next())?;
-
-        Ok(Self {
-            server,
-            user,
-            password,
-            port: port.unwrap_or(match proto {
-                Proto::HTTP => 80,
-                Proto::SOCKS4 | Proto::SOCKS4A | Proto::SOCKS5 => 1080,
-            }),
-            proto,
-        })
+    pub(crate) fn proto(&self) -> Proto {
+        self.proto
     }
 
-    pub(crate) fn connect<S: AsRef<str>>(&self, host: S, port: u16, user_agent: &str) -> String {
-        let authorization = if self.use_authorization() {
-            let creds = BASE64_STANDARD.encode(format!(
-                "{}:{}",
-                self.user.clone().unwrap_or_default(),
-                self.password.clone().unwrap_or_default()
-            ));
-
-            match self.proto {
-                Proto::HTTP => format!("Proxy-Authorization: basic {}\r\n", creds),
-                _ => String::new(),
-            }
-        } else {
-            String::new()
-        };
-
-        format!(
-            "CONNECT {}:{} HTTP/1.1\r\n\
-Host: {}:{}\r\n\
-User-Agent: {}\r\n\
-Proxy-Connection: Keep-Alive\r\n\
-{}\
-\r\n",
-            host.as_ref(),
-            port,
-            host.as_ref(),
-            port,
-            user_agent,
-            authorization
-        )
+    /// The proxy uri
+    pub fn uri(&self) -> &Uri {
+        &self.uri
     }
 
-    pub(crate) fn verify_response(response: &Response) -> Result<(), Error> {
-        match response.status() {
-            200 => Ok(()),
-            401 | 407 => Err(ErrorKind::ProxyUnauthorized.new()),
-            _ => Err(ErrorKind::ProxyConnect.new()),
+    /// The host part of the proxy uri
+    pub fn host(&self) -> &str {
+        self.uri
+            .authority()
+            .map(|a| a.host())
+            .expect("constructor to ensure there is an authority")
+    }
+
+    /// The port of the proxy uri
+    pub fn port(&self) -> u16 {
+        self.uri
+            .authority()
+            .and_then(|a| a.port_u16())
+            .unwrap_or_else(|| self.proto.default_port())
+    }
+
+    /// The username of the proxy uri
+    pub fn username(&self) -> Option<&str> {
+        self.uri.authority().and_then(|a| a.username())
+    }
+
+    /// The password of the proxy uri
+    pub fn password(&self) -> Option<&str> {
+        self.uri.authority().and_then(|a| a.password())
+    }
+
+    /// Whether this proxy setting was created manually or from
+    /// environment variables.
+    pub fn is_from_env(&self) -> bool {
+        self.from_env
+    }
+}
+
+/// Connector for CONNECT proxy settings.
+///
+/// This operates on the previous chained transport typically a TcpConnector optionally
+/// wrapped in TLS.
+pub struct ConnectProxyConnector;
+
+impl Connector for ConnectProxyConnector {
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<Box<dyn Transport>>,
+    ) -> Result<Option<Box<dyn Transport>>, Error> {
+        let Some(transport) = chained else {
+            return Ok(None);
+        };
+
+        let is_connect_proxy = details.config.connect_proxy_uri().is_some();
+
+        if is_connect_proxy {
+            // unwrap is ok because connect_proxy_uri() above checks it.
+            let proxy = details.config.proxy.as_ref().unwrap();
+
+            let mut w = TransportAdapter::new(transport);
+
+            let uri = &details.uri;
+            uri.ensure_valid_url()?;
+
+            // All these unwrap() are ok because ensure_valid_uri() above checks them.
+            let host = uri.host().unwrap();
+            let port = uri
+                .port_u16()
+                .unwrap_or(uri.scheme().unwrap().default_port().unwrap());
+
+            write!(w, "CONNECT {}:{} HTTP/1.1\r\n", host, port)?;
+            write!(w, "Host: {}:{}\r\n", host, port)?;
+            write!(w, "User-Agent: {}\r\n", details.config.user_agent)?;
+            write!(w, "Proxy-Connection: Keep-Alive\r\n")?;
+
+            let use_creds = proxy.username().is_some() || proxy.password().is_some();
+
+            if use_creds {
+                let user = proxy.username().unwrap_or_default();
+                let pass = proxy.password().unwrap_or_default();
+                let creds = BASE64_STANDARD.encode(format!("{}:{}", user, pass));
+                write!(w, "Proxy-Authorization: basic {}\r\n", creds)?;
+            }
+
+            write!(w, "\r\n")?;
+            w.flush()?;
+
+            let mut transport = w.into_inner();
+
+            let response = loop {
+                let made_progress = transport.await_input(details.timeout)?;
+                let buffers = transport.buffers();
+                let input = buffers.input();
+                let Some((used_input, response)) = try_parse_response::<20>(input)? else {
+                    if !made_progress {
+                        let reason = "proxy server did not respond".to_string();
+                        return Err(Error::ConnectProxyFailed(reason));
+                    }
+                    continue;
+                };
+                buffers.input_consume(used_input);
+                break response;
+            };
+
+            match response.status() {
+                StatusCode::OK => {
+                    trace!("CONNECT proxy connected");
+                }
+                x => {
+                    let reason = format!("proxy server responded {}/{}", x.as_u16(), x.as_str());
+                    return Err(Error::ConnectProxyFailed(reason));
+                }
+            }
+
+            Ok(Some(transport))
+        } else {
+            Ok(Some(transport))
         }
+    }
+}
+
+impl TryFrom<&str> for Proto {
+    type Error = Error;
+
+    fn try_from(scheme: &str) -> Result<Self, Self::Error> {
+        match scheme.to_ascii_lowercase().as_str() {
+            "http" => Ok(Proto::Http),
+            "https" => Ok(Proto::Https),
+            "socks4" => Ok(Proto::Socks4),
+            "socks4a" => Ok(Proto::Socks4A),
+            "socks" => Ok(Proto::Socks5),
+            "socks5" => Ok(Proto::Socks5),
+            _ => Err(Error::InvalidProxyUrl),
+        }
+    }
+}
+
+impl fmt::Debug for Proxy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Proxy")
+            .field("proto", &self.proto)
+            .field("uri", &DebugUri(&self.uri))
+            .field("from_env", &self.from_env)
+            .finish()
+    }
+}
+
+impl fmt::Display for Proto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Proto::Http => write!(f, "HTTP"),
+            Proto::Https => write!(f, "HTTPS"),
+            Proto::Socks4 => write!(f, "SOCKS4"),
+            Proto::Socks4A => write!(f, "SOCKS4a"),
+            Proto::Socks5 => write!(f, "SOCKS5"),
+        }
+    }
+}
+
+impl fmt::Debug for ConnectProxyConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyConnector").finish()
     }
 }
 
@@ -214,90 +308,90 @@ mod tests {
     #[test]
     fn parse_proxy_http_user_pass_server_port() {
         let proxy = Proxy::new("http://user:p@ssw0rd@localhost:9999").unwrap();
-        assert_eq!(proxy.user, Some(String::from("user")));
-        assert_eq!(proxy.password, Some(String::from("p@ssw0rd")));
-        assert_eq!(proxy.server, String::from("localhost"));
-        assert_eq!(proxy.port, 9999);
-        assert_eq!(proxy.proto, Proto::HTTP);
+        assert_eq!(proxy.username(), Some("user"));
+        assert_eq!(proxy.password(), Some("p@ssw0rd"));
+        assert_eq!(proxy.host(), "localhost");
+        assert_eq!(proxy.port(), 9999);
+        assert_eq!(proxy.proto, Proto::Http);
     }
 
     #[test]
     fn parse_proxy_http_user_pass_server_port_trailing_slash() {
         let proxy = Proxy::new("http://user:p@ssw0rd@localhost:9999/").unwrap();
-        assert_eq!(proxy.user, Some(String::from("user")));
-        assert_eq!(proxy.password, Some(String::from("p@ssw0rd")));
-        assert_eq!(proxy.server, String::from("localhost"));
-        assert_eq!(proxy.port, 9999);
-        assert_eq!(proxy.proto, Proto::HTTP);
+        assert_eq!(proxy.username(), Some("user"));
+        assert_eq!(proxy.password(), Some("p@ssw0rd"));
+        assert_eq!(proxy.host(), "localhost");
+        assert_eq!(proxy.port(), 9999);
+        assert_eq!(proxy.proto, Proto::Http);
     }
 
-    #[cfg(feature = "socks-proxy")]
     #[test]
     fn parse_proxy_socks4_user_pass_server_port() {
         let proxy = Proxy::new("socks4://user:p@ssw0rd@localhost:9999").unwrap();
-        assert_eq!(proxy.user, Some(String::from("user")));
-        assert_eq!(proxy.password, Some(String::from("p@ssw0rd")));
-        assert_eq!(proxy.server, String::from("localhost"));
-        assert_eq!(proxy.port, 9999);
-        assert_eq!(proxy.proto, Proto::SOCKS4);
+        assert_eq!(proxy.username(), Some("user"));
+        assert_eq!(proxy.password(), Some("p@ssw0rd"));
+        assert_eq!(proxy.host(), "localhost");
+        assert_eq!(proxy.port(), 9999);
+        assert_eq!(proxy.proto, Proto::Socks4);
     }
 
-    #[cfg(feature = "socks-proxy")]
     #[test]
     fn parse_proxy_socks4a_user_pass_server_port() {
         let proxy = Proxy::new("socks4a://user:p@ssw0rd@localhost:9999").unwrap();
-        assert_eq!(proxy.user, Some(String::from("user")));
-        assert_eq!(proxy.password, Some(String::from("p@ssw0rd")));
-        assert_eq!(proxy.server, String::from("localhost"));
-        assert_eq!(proxy.port, 9999);
-        assert_eq!(proxy.proto, Proto::SOCKS4A);
+        assert_eq!(proxy.username(), Some("user"));
+        assert_eq!(proxy.password(), Some("p@ssw0rd"));
+        assert_eq!(proxy.host(), "localhost");
+        assert_eq!(proxy.port(), 9999);
+        assert_eq!(proxy.proto, Proto::Socks4A);
     }
 
-    #[cfg(feature = "socks-proxy")]
     #[test]
     fn parse_proxy_socks_user_pass_server_port() {
         let proxy = Proxy::new("socks://user:p@ssw0rd@localhost:9999").unwrap();
-        assert_eq!(proxy.user, Some(String::from("user")));
-        assert_eq!(proxy.password, Some(String::from("p@ssw0rd")));
-        assert_eq!(proxy.server, String::from("localhost"));
-        assert_eq!(proxy.port, 9999);
-        assert_eq!(proxy.proto, Proto::SOCKS5);
+        assert_eq!(proxy.username(), Some("user"));
+        assert_eq!(proxy.password(), Some("p@ssw0rd"));
+        assert_eq!(proxy.host(), "localhost");
+        assert_eq!(proxy.port(), 9999);
+        assert_eq!(proxy.proto, Proto::Socks5);
     }
 
-    #[cfg(feature = "socks-proxy")]
     #[test]
     fn parse_proxy_socks5_user_pass_server_port() {
         let proxy = Proxy::new("socks5://user:p@ssw0rd@localhost:9999").unwrap();
-        assert_eq!(proxy.user, Some(String::from("user")));
-        assert_eq!(proxy.password, Some(String::from("p@ssw0rd")));
-        assert_eq!(proxy.server, String::from("localhost"));
-        assert_eq!(proxy.port, 9999);
-        assert_eq!(proxy.proto, Proto::SOCKS5);
+        assert_eq!(proxy.username(), Some("user"));
+        assert_eq!(proxy.password(), Some("p@ssw0rd"));
+        assert_eq!(proxy.host(), "localhost");
+        assert_eq!(proxy.port(), 9999);
+        assert_eq!(proxy.proto, Proto::Socks5);
     }
 
     #[test]
     fn parse_proxy_user_pass_server_port() {
         let proxy = Proxy::new("user:p@ssw0rd@localhost:9999").unwrap();
-        assert_eq!(proxy.user, Some(String::from("user")));
-        assert_eq!(proxy.password, Some(String::from("p@ssw0rd")));
-        assert_eq!(proxy.server, String::from("localhost"));
-        assert_eq!(proxy.port, 9999);
+        assert_eq!(proxy.username(), Some("user"));
+        assert_eq!(proxy.password(), Some("p@ssw0rd"));
+        assert_eq!(proxy.host(), "localhost");
+        assert_eq!(proxy.port(), 9999);
+        assert_eq!(proxy.proto, Proto::Http);
     }
 
     #[test]
     fn parse_proxy_server_port() {
         let proxy = Proxy::new("localhost:9999").unwrap();
-        assert_eq!(proxy.user, None);
-        assert_eq!(proxy.password, None);
-        assert_eq!(proxy.server, String::from("localhost"));
-        assert_eq!(proxy.port, 9999);
+        assert_eq!(proxy.username(), None);
+        assert_eq!(proxy.password(), None);
+        assert_eq!(proxy.host(), "localhost");
+        assert_eq!(proxy.port(), 9999);
+        assert_eq!(proxy.proto, Proto::Http);
     }
 
     #[test]
     fn parse_proxy_server() {
         let proxy = Proxy::new("localhost").unwrap();
-        assert_eq!(proxy.user, None);
-        assert_eq!(proxy.password, None);
-        assert_eq!(proxy.server, String::from("localhost"));
+        assert_eq!(proxy.username(), None);
+        assert_eq!(proxy.password(), None);
+        assert_eq!(proxy.host(), "localhost");
+        assert_eq!(proxy.port(), 80);
+        assert_eq!(proxy.proto, Proto::Http);
     }
 }

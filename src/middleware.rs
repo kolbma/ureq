@@ -1,4 +1,9 @@
-use crate::{Error, Request, Response};
+//! Chained interception to modify the request or response.
+
+use std::fmt;
+use std::sync::Arc;
+
+use crate::{Agent, Body, Error, SendBody};
 
 /// Chained processing of request (and response).
 ///
@@ -10,13 +15,22 @@ use crate::{Error, Request, Response};
 ///
 /// That means the easiest way to implement middleware is by providing a `fn`, like so
 ///
-/// ```no_run
-/// # use ureq::{Request, Response, MiddlewareNext, Error};
-/// fn my_middleware(req: Request, next: MiddlewareNext) -> Result<Response, Error> {
-///     // do middleware things
+/// ```
+/// use ureq::{Body, SendBody};
+/// use ureq::middleware::MiddlewareNext;
+/// use ureq::http::{Request, Response};
+///
+/// fn my_middleware(req: Request<SendBody>, next: MiddlewareNext)
+///     -> Result<Response<Body>, ureq::Error> {
+///
+///     // do middleware things to request
 ///
 ///     // continue the middleware chain
-///     next.handle(req)
+///     let res = next.handle(req)?;
+///
+///     // do middleware things to response
+///
+///     Ok(res)
 /// }
 /// ```
 ///
@@ -25,27 +39,32 @@ use crate::{Error, Request, Response};
 /// A common use case is to add headers to the outgoing request. Here an example of how.
 ///
 /// ```no_run
+/// use ureq::{Body, SendBody, Agent, AgentConfig};
+/// use ureq::middleware::MiddlewareNext;
+/// use ureq::http::{Request, Response, header::HeaderValue};
+///
 /// # #[cfg(feature = "json")]
-/// # fn main() -> Result<(), ureq::Error> {
-/// # use ureq::{Request, Response, MiddlewareNext, Error};
-/// # ureq::is_test(true);
-/// fn my_middleware(req: Request, next: MiddlewareNext) -> Result<Response, Error> {
+/// # {
+/// fn my_middleware(mut req: Request<SendBody>, next: MiddlewareNext)
+///     -> Result<Response<Body>, ureq::Error> {
+///
+///     req.headers_mut().insert("X-My-Header", HeaderValue::from_static("value_42"));
+///
 ///     // set my bespoke header and continue the chain
-///     next.handle(req.set("X-My-Header", "value_42"))
+///     next.handle(req)
 /// }
 ///
-/// let agent = ureq::builder()
-///     .middleware(my_middleware)
-///     .build();
+/// let mut config = AgentConfig::default();
+/// config.middleware.add(my_middleware);
+///
+/// let agent: Agent = config.into();
 ///
 /// let result: serde_json::Value =
-///     agent.get("http://httpbin.org/headers").call()?.into_json()?;
+///     agent.get("http://httpbin.org/headers").call()?.body_mut().read_json()?;
 ///
 /// assert_eq!(&result["headers"]["X-My-Header"], "value_42");
 ///
-/// # Ok(()) }
-/// # #[cfg(not(feature = "json"))]
-/// # fn main() {}
+/// # } Ok::<_, ureq::Error>(())
 /// ```
 ///
 /// # State
@@ -58,9 +77,13 @@ use crate::{Error, Request, Response};
 /// In the `examples` directory there is an additional example `count-bytes.rs` which uses
 /// a mutex lock like shown below.
 ///
-/// ```no_run
-/// # use ureq::{Request, Response, Middleware, MiddlewareNext, Error};
-/// # use std::sync::{Arc, Mutex};
+/// ```
+/// use std::sync::{Arc, Mutex};
+///
+/// use ureq::{Body, SendBody};
+/// use ureq::middleware::{Middleware, MiddlewareNext};
+/// use ureq::http::{Request, Response};
+///
 /// struct MyState {
 ///     // whatever is needed
 /// }
@@ -68,7 +91,9 @@ use crate::{Error, Request, Response};
 /// struct MyMiddleware(Arc<Mutex<MyState>>);
 ///
 /// impl Middleware for MyMiddleware {
-///     fn handle(&self, request: Request, next: MiddlewareNext) -> Result<Response, Error> {
+///     fn handle(&self, request: Request<SendBody>, next: MiddlewareNext)
+///         -> Result<Response<Body>, ureq::Error> {
+///
 ///         // These extra brackets ensures we release the Mutex lock before continuing the
 ///         // chain. There could also be scenarios where we want to maintain the lock through
 ///         // the invocation, which would block other requests from proceeding concurrently
@@ -89,10 +114,10 @@ use crate::{Error, Request, Response};
 /// This example shows how we can increase a counter for each request going
 /// through the agent.
 ///
-/// ```no_run
-/// # fn main() -> Result<(), ureq::Error> {
-/// # ureq::is_test(true);
-/// use ureq::{Request, Response, Middleware, MiddlewareNext, Error};
+/// ```
+/// use ureq::{Body, SendBody, Agent, AgentConfig};
+/// use ureq::middleware::{Middleware, MiddlewareNext};
+/// use ureq::http::{Request, Response};
 /// use std::sync::atomic::{AtomicU64, Ordering};
 /// use std::sync::Arc;
 ///
@@ -102,7 +127,9 @@ use crate::{Error, Request, Response};
 /// struct MyCounter(Arc<AtomicU64>);
 ///
 /// impl Middleware for MyCounter {
-///     fn handle(&self, req: Request, next: MiddlewareNext) -> Result<Response, Error> {
+///     fn handle(&self, req: Request<SendBody>, next: MiddlewareNext)
+///         -> Result<Response<Body>, ureq::Error> {
+///
 ///         // increase the counter for each invocation
 ///         self.0.fetch_add(1, Ordering::SeqCst);
 ///
@@ -113,10 +140,10 @@ use crate::{Error, Request, Response};
 ///
 /// let shared_counter = Arc::new(AtomicU64::new(0));
 ///
-/// let agent = ureq::builder()
-///     // Add our middleware
-///     .middleware(MyCounter(shared_counter.clone()))
-///     .build();
+/// let mut config = AgentConfig::default();
+/// config.middleware.add(MyCounter(shared_counter.clone()));
+///
+/// let agent: Agent = config.into();
 ///
 /// agent.get("http://httpbin.org/get").call()?;
 /// agent.get("http://httpbin.org/get").call()?;
@@ -124,43 +151,92 @@ use crate::{Error, Request, Response};
 /// // Check we did indeed increase the counter twice.
 /// assert_eq!(shared_counter.load(Ordering::SeqCst), 2);
 ///
-/// # Ok(()) }
+/// # Ok::<_, ureq::Error>(())
 /// ```
 pub trait Middleware: Send + Sync + 'static {
     /// Handle of the middleware logic.
-    fn handle(&self, request: Request, next: MiddlewareNext) -> Result<Response, Error>;
+    fn handle(
+        &self,
+        request: http::Request<SendBody>,
+        next: MiddlewareNext,
+    ) -> Result<http::Response<Body>, Error>;
+}
+
+/// A chain of middleware.
+///
+/// Defaults to an empty chain.
+///
+/// This is set in [`AgentConfig`](crate::AgentConfig).
+#[derive(Clone, Default)]
+pub struct MiddlewareChain {
+    chain: Arc<Vec<Box<dyn Middleware>>>,
+}
+
+impl MiddlewareChain {
+    /// Add another middleware to this chain.
+    ///
+    /// Middleware are run in the order they are added.
+    pub fn add(&mut self, mw: impl Middleware) {
+        let Some(chain) = Arc::get_mut(&mut self.chain) else {
+            panic!("Can't add to a MiddlewareChain that is already cloned")
+        };
+
+        chain.push(Box::new(mw));
+    }
 }
 
 /// Continuation of a [`Middleware`] chain.
 pub struct MiddlewareNext<'a> {
-    pub(crate) chain: &'a mut (dyn Iterator<Item = &'a dyn Middleware>),
-    // Since request_fn consumes the Payload<'a>, we must have an FnOnce.
-    //
-    // It's possible to get rid of this Box if we make MiddlewareNext generic
-    // over some type variable, i.e. MiddlewareNext<'a, R> where R: FnOnce...
-    // however that would "leak" to Middleware::handle introducing a complicated
-    // type signature that is totally irrelevant for someone implementing a middleware.
-    //
-    // So in the name of having a sane external API, we accept this Box.
-    pub(crate) request_fn: Box<dyn FnOnce(Request) -> Result<Response, Error> + 'a>,
+    agent: &'a Agent,
+    index: usize,
 }
 
 impl<'a> MiddlewareNext<'a> {
-    /// Continue the middleware chain by providing (a possibly amended) [`Request`].
-    pub fn handle(self, request: Request) -> Result<Response, Error> {
-        if let Some(step) = self.chain.next() {
-            step.handle(request, self)
+    pub(crate) fn new(agent: &'a Agent) -> Self {
+        MiddlewareNext { agent, index: 0 }
+    }
+
+    /// Continue the middleware chain.
+    ///
+    /// The middleware must call this in order to run the request. Not calling
+    /// it is a valid choice for not wanting the request to execute.
+    pub fn handle(
+        mut self,
+        request: http::Request<SendBody>,
+    ) -> Result<http::Response<Body>, Error> {
+        if let Some(mw) = self.agent.config().middleware.chain.get(self.index) {
+            // This middleware exists, run it.
+            self.index += 1;
+            mw.handle(request, self)
         } else {
-            (self.request_fn)(request)
+            // When chain is over, call the actual do_run on agent.
+            let (parts, body) = request.into_parts();
+            let request = http::Request::from_parts(parts, ());
+            self.agent.do_run(request, body)
         }
     }
 }
 
 impl<F> Middleware for F
 where
-    F: Fn(Request, MiddlewareNext) -> Result<Response, Error> + Send + Sync + 'static,
+    F: Fn(http::Request<SendBody>, MiddlewareNext) -> Result<http::Response<Body>, Error>
+        + Send
+        + Sync
+        + 'static,
 {
-    fn handle(&self, request: Request, next: MiddlewareNext) -> Result<Response, Error> {
+    fn handle(
+        &self,
+        request: http::Request<SendBody>,
+        next: MiddlewareNext,
+    ) -> Result<http::Response<Body>, Error> {
         (self)(request, next)
+    }
+}
+
+impl fmt::Debug for MiddlewareChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MiddlewareChain")
+            .field("len", &self.chain.len())
+            .finish()
     }
 }

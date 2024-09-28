@@ -1,612 +1,372 @@
-use std::io::Read;
-use std::{fmt, time};
+use std::convert::TryFrom;
+use std::fmt;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 
-use url::{form_urlencoded, ParseError, Url};
+use http::{HeaderName, HeaderValue, Method, Request, Response, Uri, Version};
 
-use crate::agent::Agent;
-use crate::body::Payload;
-use crate::error::{Error, ErrorKind};
-use crate::header::{self, Header};
-use crate::middleware::MiddlewareNext;
-use crate::unit::{self, Unit};
-use crate::Response;
+use crate::body::Body;
+use crate::send_body::AsSendBody;
+use crate::util::private::Private;
+use crate::{Agent, AgentConfig, Error, SendBody, Timeouts};
 
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// Request instances are builders that creates a request.
+/// Transparent wrapper around [`http::request::Builder`].
 ///
-/// ```
-/// # fn main() -> Result<(), ureq::Error> {
-/// # ureq::is_test(true);
-/// let response = ureq::get("http://example.com/get")
-///     .query("foo", "bar baz")  // add ?foo=bar+baz
-///     .call()?;                 // run the request
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone)]
-#[must_use = "Requests do nothing until consumed by `call()`"]
-pub struct Request {
+/// The purpose is to provide the [`.call()`][RequestBuilder::call] and [`.send()`][RequestBuilder::send]
+/// functions to make a simpler API for sending requests.
+pub struct RequestBuilder<B> {
     agent: Agent,
-    method: String,
-    url: String,
-    pub(crate) headers: Vec<Header>,
-    timeout: Option<time::Duration>,
+    builder: http::request::Builder,
+
+    // This is only used in case http::request::Builder contains an error
+    // (such as URL parsing error), and the user wants a `.config()`.
+    dummy_config: Option<Box<AgentConfig>>,
+
+    _ph: PhantomData<B>,
 }
 
-impl fmt::Debug for Request {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Request({} {}, {:?})",
-            self.method, self.url, self.headers
-        )
-    }
-}
+#[derive(Debug)]
+pub struct WithoutBody(());
+impl Private for WithoutBody {}
 
-impl Request {
-    pub(crate) fn new(agent: Agent, method: String, url: String) -> Request {
-        Request {
-            agent,
-            method,
-            url,
-            headers: vec![],
-            timeout: None,
-        }
-    }
+#[derive(Debug)]
+pub struct WithBody(());
+impl Private for WithBody {}
 
-    #[inline(always)]
-    /// Sets overall timeout for the request, overriding agent's configuration if any.
-    pub fn timeout(mut self, timeout: time::Duration) -> Self {
-        self.timeout = Some(timeout);
+impl<Any> RequestBuilder<Any> {
+    /// Appends a header to this request builder.
+    ///
+    /// This function will append the provided key/value as a header to the
+    /// set of headers. It does not replace headers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let req = ureq::get("https://httpbin.org/get")
+    ///     .header("X-Custom-Foo", "bar");
+    /// ```
+    pub fn header<K, V>(mut self, key: K, value: V) -> Self
+    where
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        self.builder = self.builder.header(key, value);
         self
     }
 
-    /// Sends the request with no body and blocks the caller until done.
+    /// Overrides the URI for this request.
     ///
-    /// Use this with GET, HEAD, OPTIONS or TRACE. It sends neither
-    /// Content-Length nor Transfer-Encoding.
+    /// Typically this is set via `ureq::get(<uri>)` or `Agent::get(<uri>)`. This
+    /// lets us change it.
+    ///
+    /// # Examples
     ///
     /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let resp = ureq::get("http://example.com/")
+    /// let req = ureq::get("https://www.google.com/")
+    ///     .uri("https://httpbin.org/get");
+    /// ```
+    pub fn uri<T>(mut self, uri: T) -> Self
+    where
+        Uri: TryFrom<T>,
+        <Uri as TryFrom<T>>::Error: Into<http::Error>,
+    {
+        self.builder = self.builder.uri(uri);
+        self
+    }
+
+    /// Set the HTTP version for this request.
+    ///
+    /// By default this is HTTP/1.1.
+    /// ureq only handles HTTP/1.1 and HTTP/1.0.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ureq::http::Version;
+    ///
+    /// let req = ureq::get("https://www.google.com/")
+    ///     .version(Version::HTTP_10);
+    /// ```
+    pub fn version(mut self, version: Version) -> Self {
+        self.builder = self.builder.version(version);
+        self
+    }
+
+    /// Override agent level config on the request level.
+    ///
+    /// The agent config is copied and modified on request level.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ureq::{Agent, AgentConfig, Timeouts};
+    /// use std::time::Duration;
+    ///
+    /// let agent: Agent = AgentConfig {
+    ///     https_only: false,
+    ///     ..Default::default()
+    /// }.into();
+    ///
+    /// let mut builder = agent.get("http://httpbin.org/get");
+    ///
+    /// let config = builder.config();
+    /// config.https_only = true;
+    ///
+    /// // Make the request
+    /// let result = builder.call();
+    ///
+    /// // The https_only was set on request level
+    /// assert!(matches!(result.unwrap_err(), ureq::Error::RequireHttpsOnly(_)));
+    ///
+    /// // The request level did not affect the agent level
+    /// assert!(!agent.config().https_only);
+    /// # Ok::<_, ureq::Error>(())
+    /// ```
+    pub fn config(&mut self) -> &mut AgentConfig {
+        self.request_level_config()
+    }
+
+    /// Override agent timeouts on the request level.
+    ///
+    /// The agent config is copied and modified on request level.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ureq::{Agent, AgentConfig, Timeouts};
+    /// use std::time::Duration;
+    ///
+    /// let agent: Agent = AgentConfig {
+    ///     timeouts: Timeouts {
+    ///         global: Some(Duration::from_secs(10)),
+    ///        ..Default::default()
+    ///     },
+    ///     ..Default::default()
+    /// }.into();
+    ///
+    /// let mut builder = agent.get("https://httpbin.org/get");
+    ///
+    /// // This clones the timeouts from agent level to request level.
+    /// let timeouts = builder.timeouts();
+    ///
+    /// assert_eq!(timeouts.global, Some(Duration::from_secs(10)));
+    ///
+    /// // Override the global timeout on the request level.
+    /// timeouts.global = Some(Duration::from_secs(3));
+    ///
+    /// // Make the request
+    /// let response = builder.call()?;
+    /// # Ok::<_, ureq::Error>(())
+    /// ```
+    pub fn timeouts(&mut self) -> &mut Timeouts {
+        &mut self.request_level_config().timeouts
+    }
+
+    fn request_level_config(&mut self) -> &mut AgentConfig {
+        let Some(exts) = self.builder.extensions_mut() else {
+            // This means self.builder has an error such as URL parsing error.
+            // The error will surface on .call() (or .send()) and we fill in
+            // a dummy AgentConfig meanwhile.
+            return self
+                .dummy_config
+                .get_or_insert_with(|| Box::new(AgentConfig::default()));
+        };
+
+        if exts.get::<AgentConfig>().is_none() {
+            let config_ref = &*self.agent.config;
+            // This is the cost of setting request level config
+            let config: AgentConfig = config_ref.clone();
+            exts.insert(config);
+        }
+
+        // Unwrap is OK because of above check
+        exts.get_mut().unwrap()
+    }
+}
+
+impl RequestBuilder<WithoutBody> {
+    pub(crate) fn new<T>(agent: Agent, method: Method, uri: T) -> Self
+    where
+        Uri: TryFrom<T>,
+        <Uri as TryFrom<T>>::Error: Into<http::Error>,
+    {
+        Self {
+            agent,
+            builder: Request::builder().method(method).uri(uri),
+            dummy_config: None,
+            _ph: PhantomData,
+        }
+    }
+
+    /// Sends the request and blocks the caller until we receive a response.
+    ///
+    /// It sends neither `Content-Length` nor `Transfer-Encoding`.
+    ///
+    /// ```
+    /// let res = ureq::get("http://httpbin.org/get")
     ///     .call()?;
-    /// # Ok(())
-    /// # }
+    /// # Ok::<_, ureq::Error>(())
     /// ```
-    pub fn call(self) -> Result<Response> {
-        self.do_call(Payload::Empty)
+    pub fn call(self) -> Result<Response<Body>, Error> {
+        let request = self.builder.body(())?;
+        do_call(self.agent, request, SendBody::none())
     }
+}
 
-    fn parse_url(&self) -> Result<Url> {
-        Ok(self.url.parse().and_then(|url: Url|
-            // No hostname is fine for urls in general, but not for website urls.
-            if url.host_str().is_none() {
-                Err(ParseError::EmptyHost)
-            } else {
-                Ok(url)
-            }
-        )?)
-    }
-
-    /// Add Accept-Encoding header with supported values, unless user has
-    /// already set this header or is requesting a specific byte-range.
-    #[cfg(any(feature = "gzip", feature = "brotli"))]
-    fn add_accept_encoding(&mut self) {
-        let should_add = !self.headers.iter().map(|h| h.name()).any(|name| {
-            name.eq_ignore_ascii_case("accept-encoding") || name.eq_ignore_ascii_case("range")
-        });
-        if should_add {
-            const GZ: bool = cfg!(feature = "gzip");
-            const BR: bool = cfg!(feature = "brotli");
-            const ACCEPT: &str = match (GZ, BR) {
-                (true, true) => "gzip, br",
-                (true, false) => "gzip",
-                (false, true) => "br",
-                (false, false) => "identity", // unreachable due to cfg feature on this fn
-            };
-            self.headers.push(Header::new("accept-encoding", ACCEPT));
+impl RequestBuilder<WithBody> {
+    pub(crate) fn new<T>(agent: Agent, method: Method, uri: T) -> Self
+    where
+        Uri: TryFrom<T>,
+        <Uri as TryFrom<T>>::Error: Into<http::Error>,
+    {
+        Self {
+            agent,
+            builder: Request::builder().method(method).uri(uri),
+            dummy_config: None,
+            _ph: PhantomData,
         }
     }
 
-    #[cfg_attr(not(any(feature = "gzip", feature = "brotli")), allow(unused_mut))]
-    fn do_call(mut self, payload: Payload) -> Result<Response> {
-        for h in &self.headers {
-            h.validate()?;
-        }
-
-        #[cfg(any(feature = "gzip", feature = "brotli"))]
-        self.add_accept_encoding();
-
-        let deadline = match self.timeout.or(self.agent.config.timeout) {
-            None => None,
-            Some(timeout) => {
-                let now = time::Instant::now();
-                match now.checked_add(timeout) {
-                    Some(dl) => Some(dl),
-                    None => {
-                        return Err(Error::new(
-                            ErrorKind::Io,
-                            Some("Request deadline overflowed".to_string()),
-                        ))
-                    }
-                }
-            }
-        };
-
-        let request_fn = |req: Request| {
-            let reader = payload.into_read();
-            let url = req.parse_url()?;
-            let unit = Unit::new(
-                &req.agent,
-                &req.method,
-                &url,
-                req.headers,
-                &reader,
-                deadline,
-            );
-
-            unit::connect(unit, true, reader).map_err(|e| e.url(url))
-        };
-
-        let response = if !self.agent.state.middleware.is_empty() {
-            // Clone agent to get a local copy with same lifetime as Payload
-            let agent = self.agent.clone();
-            let chain = &mut agent.state.middleware.iter().map(|mw| mw.as_ref());
-
-            let request_fn = Box::new(request_fn);
-
-            let next = MiddlewareNext { chain, request_fn };
-
-            // // Run middleware chain
-            next.handle(self)?
-        } else {
-            // Run the request_fn without any further indirection.
-            request_fn(self)?
-        };
-
-        if response.status() >= 400 {
-            Err(Error::Status(response.status(), response))
-        } else {
-            Ok(response)
-        }
-    }
-
-    /// Send data a json value.
-    ///
-    /// The `Content-Length` header is implicitly set to the length of the serialized value.
+    /// Set the content-type header.
     ///
     /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let resp = ureq::post("http://httpbin.org/post")
-    ///     .send_json(ureq::json!({
-    ///       "name": "martin",
-    ///       "rust": true,
-    ///     }))?;
-    /// # Ok(())
-    /// # }
+    /// let res = ureq::post("http://httpbin.org/post")
+    ///     .content_type("text/html; charset=utf-8")
+    ///     .send("<html><body>åäö</body></html>")?;
+    /// # Ok::<_, ureq::Error>(())
+    /// ```
+    pub fn content_type<V>(mut self, content_type: V) -> Self
+    where
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        self.builder = self.builder.header("content-type", content_type);
+        self
+    }
+
+    /// Send body data and blocks the caller until we receive response.
+    ///
+    /// ```
+    /// let res = ureq::post("http://httpbin.org/post")
+    ///     .send(&[0_u8; 1000])?;
+    /// # Ok::<_, ureq::Error>(())
+    /// ```
+    pub fn send(self, data: impl AsSendBody) -> Result<Response<Body>, Error> {
+        let request = self.builder.body(())?;
+        let mut data_ref = data;
+        do_call(self.agent, request, data_ref.as_body())
+    }
+
+    /// Send body data as JSON.
+    ///
+    /// Requires the **json** feature.
+    ///
+    /// The data typically derives [`Serialize`](serde::Serialize) and is converted
+    /// to a string before sending (does allocate).
+    ///
+    /// ```
+    /// use serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct MyData {
+    ///     thing: String,
+    /// }
+    ///
+    /// let body = MyData {
+    ///     thing: "yo".to_string(),
+    /// };
+    ///
+    /// let res = ureq::post("http://httpbin.org/post")
+    ///     .send_json(&body)?;
+    /// # Ok::<_, ureq::Error>(())
     /// ```
     #[cfg(feature = "json")]
-    pub fn send_json(mut self, data: impl serde::Serialize) -> Result<Response> {
-        if self.header("Content-Type").is_none() {
-            self = self.set("Content-Type", "application/json");
-        }
-
-        let json_bytes = serde_json::to_vec(&data)
-            .expect("Failed to serialize data passed to send_json into JSON");
-
-        self.do_call(Payload::Bytes(&json_bytes))
-    }
-
-    /// Send data as bytes.
-    ///
-    /// The `Content-Length` header is implicitly set to the length of the serialized value.
-    ///
-    /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let resp = ureq::put("http://httpbin.org/put")
-    ///     .send_bytes(&[0; 1000])?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn send_bytes(self, data: &[u8]) -> Result<Response> {
-        self.do_call(Payload::Bytes(data))
-    }
-
-    /// Send data as a string.
-    ///
-    /// The `Content-Length` header is implicitly set to the length of the serialized value.
-    /// Defaults to `utf-8`
-    ///
-    /// ## Charset support
-    ///
-    /// Requires feature `ureq = { version = "*", features = ["charset"] }`
-    ///
-    /// If a `Content-Type` header is present and it contains a charset specification, we
-    /// attempt to encode the string using that character set. If it fails, we fall back
-    /// on utf-8.
-    ///
-    /// ```
-    /// // this example requires features = ["charset"]
-    ///
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let resp = ureq::post("http://httpbin.org/post")
-    ///     .set("Content-Type", "text/plain; charset=iso-8859-1")
-    ///     .send_string("Hällo Wörld!")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn send_string(self, data: &str) -> Result<Response> {
-        let charset =
-            crate::response::charset_from_content_type(self.header("content-type")).to_string();
-        self.do_call(Payload::Text(data, charset))
-    }
-
-    /// Send a sequence of (key, value) pairs as form-urlencoded data.
-    ///
-    /// The `Content-Type` header is implicitly set to application/x-www-form-urlencoded.
-    /// The `Content-Length` header is implicitly set to the length of the serialized value.
-    ///
-    /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let resp = ureq::post("http://httpbin.org/post")
-    ///     .send_form(&[
-    ///       ("foo", "bar"),
-    ///       ("foo2", "bar2"),
-    ///     ])?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn send_form(mut self, data: &[(&str, &str)]) -> Result<Response> {
-        if self.header("Content-Type").is_none() {
-            self = self.set("Content-Type", "application/x-www-form-urlencoded");
-        }
-        let encoded = form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(data)
-            .finish();
-        self.do_call(Payload::Bytes(&encoded.into_bytes()))
-    }
-
-    /// Send data from a reader.
-    ///
-    /// If no Content-Length and Transfer-Encoding header has been set, it uses the [chunked transfer encoding](https://tools.ietf.org/html/rfc7230#section-4.1).
-    ///
-    /// The caller may set the Content-Length header to the expected byte size of the reader if is
-    /// known.
-    ///
-    /// The input from the reader is buffered into chunks of size 16,384, the max size of a TLS fragment.
-    ///
-    /// ```
-    /// use std::io::Cursor;
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let read = Cursor::new(vec![0x20; 100]);
-    /// let resp = ureq::post("http://httpbin.org/post")
-    ///     .send(read)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn send(self, reader: impl Read) -> Result<Response> {
-        self.do_call(Payload::Reader(Box::new(reader)))
-    }
-
-    /// Set a header field.
-    ///
-    /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let resp = ureq::get("http://httpbin.org/bytes/1000")
-    ///     .set("Accept", "text/plain")
-    ///     .set("Range", "bytes=500-999")
-    ///     .call()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn set(mut self, header: &str, value: &str) -> Self {
-        header::add_header(&mut self.headers, Header::new(header, value));
-        self
-    }
-
-    /// Returns the value for a set header.
-    ///
-    /// ```
-    /// let req = ureq::get("/my_page")
-    ///     .set("X-API-Key", "foobar");
-    /// assert_eq!("foobar", req.header("x-api-Key").unwrap());
-    /// ```
-    pub fn header(&self, name: &str) -> Option<&str> {
-        header::get_header(&self.headers, name)
-    }
-
-    /// A list of the set header names in this request. Lowercased to be uniform.
-    ///
-    /// ```
-    /// let req = ureq::get("/my_page")
-    ///     .set("X-API-Key", "foobar")
-    ///     .set("Content-Type", "application/json");
-    /// assert_eq!(req.header_names(), vec!["x-api-key", "content-type"]);
-    /// ```
-    pub fn header_names(&self) -> Vec<String> {
-        self.headers
-            .iter()
-            .map(|h| h.name().to_ascii_lowercase())
-            .collect()
-    }
-
-    /// Tells if the header has been set.
-    ///
-    /// ```
-    /// let req = ureq::get("/my_page")
-    ///     .set("X-API-Key", "foobar");
-    /// assert_eq!(true, req.has("x-api-Key"));
-    /// ```
-    pub fn has(&self, name: &str) -> bool {
-        header::has_header(&self.headers, name)
-    }
-
-    /// All headers corresponding values for the give name, or empty vector.
-    ///
-    /// ```
-    /// let req = ureq::get("/my_page")
-    ///     .set("X-Forwarded-For", "1.2.3.4")
-    ///     .set("X-Forwarded-For", "2.3.4.5");
-    ///
-    /// assert_eq!(req.all("x-forwarded-for"), vec![
-    ///     "1.2.3.4",
-    ///     "2.3.4.5",
-    /// ]);
-    /// ```
-    pub fn all(&self, name: &str) -> Vec<&str> {
-        header::get_all_headers(&self.headers, name)
-    }
-
-    /// Set a query parameter.
-    ///
-    /// For example, to set `?format=json&dest=/login`
-    ///
-    /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let resp = ureq::get("http://httpbin.org/get")
-    ///     .query("format", "json")
-    ///     .query("dest", "/login")
-    ///     .call()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn query(mut self, param: &str, value: &str) -> Self {
-        if let Ok(mut url) = self.parse_url() {
-            url.query_pairs_mut().append_pair(param, value);
-
-            // replace url
-            self.url = url.to_string();
-        }
-        self
-    }
-
-    /// Set multi query parameters.
-    ///
-    /// For example, to set `?format=json&dest=/login`
-    ///
-    /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    ///
-    /// let query = vec![
-    ///     ("format", "json"),
-    ///     ("dest", "/login"),
-    /// ];
-    ///
-    /// let resp = ureq::get("http://httpbin.org/get")
-    ///     .query_pairs(query)
-    ///     .call()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn query_pairs<'a, P>(mut self, pairs: P) -> Self
-    where
-        P: IntoIterator<Item = (&'a str, &'a str)>,
-    {
-        if let Ok(mut url) = self.parse_url() {
-            {
-                let mut query_pairs = url.query_pairs_mut();
-                for (param, value) in pairs {
-                    query_pairs.append_pair(param, value);
-                }
-            }
-
-            // replace url
-            self.url = url.to_string();
-        }
-        self
-    }
-
-    /// Returns the value of the request method. Something like `GET`, `POST`, `PUT` etc.
-    ///
-    /// ```
-    /// let req = ureq::put("http://httpbin.org/put");
-    ///
-    /// assert_eq!(req.method(), "PUT");
-    /// ```
-    pub fn method(&self) -> &str {
-        &self.method
-    }
-
-    /// Get the url str that will be used for this request.
-    ///
-    /// The url might differ from that originally provided when constructing the
-    /// request if additional query parameters have been added using [`Request::query()`].
-    ///
-    /// In case the original url provided to build the request is not possible to
-    /// parse to a Url, this function returns the original, and it will error once the
-    /// Request object is used.
-    ///
-    /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let req = ureq::get("http://httpbin.org/get")
-    ///     .query("foo", "bar");
-    ///
-    /// assert_eq!(req.url(), "http://httpbin.org/get?foo=bar");
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let req = ureq::get("SO WRONG")
-    ///     .query("foo", "bar"); // does nothing
-    ///
-    /// assert_eq!(req.url(), "SO WRONG");
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// Get the parsed url that will be used for this request. The parsed url
-    /// has functions to inspect the parts of the url further.
-    ///
-    /// The url might differ from that originally provided when constructing the
-    /// request if additional query parameters have been added using [`Request::query()`].
-    ///
-    /// Returns a `Result` since a common use case is to construct
-    /// the [`Request`] using a `&str` in which case the url needs to be parsed
-    /// to inspect the parts. If the Request url is not possible to parse, this
-    /// function produces the same error that would otherwise happen when
-    /// `call` or `send_*` is called.
-    ///
-    /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let req = ureq::get("http://httpbin.org/get")
-    ///     .query("foo", "bar");
-    ///
-    /// assert_eq!(req.request_url()?.host(), "httpbin.org");
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn request_url(&self) -> Result<RequestUrl> {
-        Ok(RequestUrl::new(self.parse_url()?))
+    pub fn send_json(self, data: impl serde::ser::Serialize) -> Result<Response<Body>, Error> {
+        let request = self.builder.body(())?;
+        let body = SendBody::from_json(&data)?;
+        do_call(self.agent, request, body)
     }
 }
 
-/// Parsed result of a request url with handy inspection methods.
-#[derive(Debug, Clone)]
-pub struct RequestUrl {
-    url: Url,
-    query_pairs: Vec<(String, String)>,
+fn do_call(agent: Agent, request: Request<()>, body: SendBody) -> Result<Response<Body>, Error> {
+    let response = agent.run_middleware(request, body)?;
+    Ok(response)
 }
 
-impl RequestUrl {
-    fn new(url: Url) -> Self {
-        // This is needed to avoid url::Url Cow<str>. We want ureq API to work with &str.
-        let query_pairs = url
-            .query_pairs()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+impl<MethodLimit> Deref for RequestBuilder<MethodLimit> {
+    type Target = http::request::Builder;
 
-        RequestUrl { url, query_pairs }
+    fn deref(&self) -> &Self::Target {
+        &self.builder
     }
+}
 
-    /// Handle the request url as a standard [`url::Url`].
-    pub fn as_url(&self) -> &Url {
-        &self.url
+impl<MethodLimit> DerefMut for RequestBuilder<MethodLimit> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.builder
     }
+}
 
-    /// Get the scheme of the request url, i.e. "https" or "http".
-    pub fn scheme(&self) -> &str {
-        self.url.scheme()
+impl fmt::Debug for RequestBuilder<WithoutBody> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestBuilder<WithoutBody>")
+            // unwraps are OK because we can't be in this state without having method+uri
+            .field("method", &self.builder.method_ref().unwrap())
+            .field("uri", &self.builder.uri_ref().unwrap())
+            .finish()
     }
+}
 
-    /// Host of the request url.
-    pub fn host(&self) -> &str {
-        // this unwrap() is ok, because RequestUrl is tested for empty host
-        // urls in Request::parse_url().
-        self.url.host_str().unwrap()
-    }
-
-    /// Port of the request url, if available. Ports are only available if they
-    /// are present in the original url. Specifically the scheme default ports,
-    /// 443 for `https` and and 80 for `http` are `None` unless explicitly
-    /// set in the url, i.e. `https://my-host.com:443/some/path`.
-    pub fn port(&self) -> Option<u16> {
-        self.url.port()
-    }
-
-    /// Path of the request url.
-    pub fn path(&self) -> &str {
-        self.url.path()
-    }
-
-    /// Returns all query parameters as a vector of key-value pairs.
-    ///
-    /// ```
-    /// # fn main() -> Result<(), ureq::Error> {
-    /// # ureq::is_test(true);
-    /// let req = ureq::get("http://httpbin.org/get")
-    ///     .query("foo", "42")
-    ///     .query("foo", "43");
-    ///
-    /// assert_eq!(req.request_url()?.query_pairs(), vec![
-    ///     ("foo", "42"),
-    ///     ("foo", "43")
-    /// ]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn query_pairs(&self) -> Vec<(&str, &str)> {
-        self.query_pairs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
+impl fmt::Debug for RequestBuilder<WithBody> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestBuilder<WithBody>")
+            // unwraps are OK because we can't be in this state without having method+uri
+            .field("method", &self.builder.method_ref().unwrap())
+            .field("uri", &self.builder.uri_ref().unwrap())
+            .finish()
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
+    use std::time::Duration;
+
+    use crate::get;
+    use crate::test::init_test_log;
+
     use super::*;
 
     #[test]
-    fn request_implements_send_and_sync() {
-        let _request: Box<dyn Send> = Box::new(Request::new(
-            Agent::new(),
-            "GET".to_string(),
-            "https://example.com/".to_string(),
-        ));
-        let _request: Box<dyn Sync> = Box::new(Request::new(
-            Agent::new(),
-            "GET".to_string(),
-            "https://example.com/".to_string(),
-        ));
-    }
-
-    #[test]
-    fn send_byte_slice() {
-        let bytes = vec![1, 2, 3];
-        crate::agent()
-            .post("http://example.com")
-            .send(&bytes[1..2])
-            .ok();
-    }
-
-    #[test]
     fn disallow_empty_host() {
-        let req = crate::agent().get("file:///some/path");
+        let err = crate::get("file:///some/path").call().unwrap_err();
+        assert_eq!(err.to_string(), "http: invalid format");
+        assert!(matches!(err, Error::Http(_)));
+    }
 
-        // Both request_url and call() must surface the same error.
+    #[test]
+    fn debug_print_without_body() {
+        let call = crate::get("https://foo/bar");
         assert_eq!(
-            req.request_url().unwrap_err().kind(),
-            crate::ErrorKind::InvalidUrl
+            format!("{:?}", call),
+            "RequestBuilder<WithoutBody> { method: GET, uri: https://foo/bar }"
         );
+    }
 
-        assert_eq!(req.call().unwrap_err().kind(), crate::ErrorKind::InvalidUrl);
+    #[test]
+    fn debug_print_with_body() {
+        let call = crate::post("https://foo/bar");
+        assert_eq!(
+            format!("{:?}", call),
+            "RequestBuilder<WithBody> { method: POST, uri: https://foo/bar }"
+        );
+    }
+
+    #[test]
+    fn config_after_broken_url() {
+        init_test_log();
+        let mut req = get("http://x.y.z/ borked url");
+        req.timeouts().global = Some(Duration::from_millis(1));
     }
 }
