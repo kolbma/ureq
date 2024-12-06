@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ureq::{Error, ReadWrite, TlsConnector};
 
-pub fn main() -> Result<(), Error> {
+pub fn main() -> Result<(), Box<Error>> {
     let pass = PassThrough {
         handshake_fail: false,
     };

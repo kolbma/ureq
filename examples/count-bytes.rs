@@ -12,7 +12,7 @@ struct CounterState {
 // Middleware wrapper working off the shared state.
 struct CounterMiddleware(Arc<Mutex<CounterState>>);
 
-pub fn main() -> Result<(), Error> {
+pub fn main() -> Result<(), Box<Error>> {
     // Shared state for counters.
     let shared_state = Arc::new(Mutex::new(CounterState::default()));
 
