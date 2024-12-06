@@ -145,7 +145,7 @@ pub struct MiddlewareNext<'a> {
     pub(crate) request_fn: Box<dyn FnOnce(Request) -> Result<Response, Error> + 'a>,
 }
 
-impl<'a> MiddlewareNext<'a> {
+impl MiddlewareNext<'_> {
     /// Continue the middleware chain by providing (a possibly amended) [`Request`].
     pub fn handle(self, request: Request) -> Result<Response, Error> {
         if let Some(step) = self.chain.next() {
