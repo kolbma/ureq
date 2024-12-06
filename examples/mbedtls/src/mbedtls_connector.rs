@@ -62,7 +62,7 @@ impl TlsConnector for MbedTlsConnector {
     ) -> Result<Box<dyn ReadWrite>, Error> {
         let mut ctx = self.context.lock().unwrap();
         match ctx.establish(io, None) {
-            Err(e) => {
+            Err(_e) => {
                 let io_err = io::Error::new(io::ErrorKind::InvalidData, MbedTlsError);
                 return Err(io_err.into());
             }
@@ -71,6 +71,7 @@ impl TlsConnector for MbedTlsConnector {
     }
 }
 
+#[allow(dead_code)]
 struct SyncIo(Mutex<Box<dyn ReadWrite>>);
 
 impl io::Read for SyncIo {
