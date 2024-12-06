@@ -23,28 +23,27 @@ targets = [
 ]
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
 yanked = "deny"
 ignore = []
 
 [bans]
 multiple-versions = "deny"
-wildcards = "allow"        # at least until https://github.com/EmbarkStudios/cargo-deny/issues/241 is fixed
+wildcards = "deny"
 deny = []
 
 skip = [
-  { name = "bitflags" }, # Unfortunate duplicate dependency due to old version beeing pulled in by `security-framework`
+  { crate = "core-foundation@0.9.4", reason = "feature native-tls is using older version" },
+  { crate = "http@0.2.12", reason = "feature http-interop depends on http-02" },
+  { crate = "security-framework@2.11.1", reason = "feature native-tls is using older version" },
 ]
-skip-tree = []
+skip-tree = [
+  { crate = "windows-sys@0.52.0", reason = "a foundational crate for many that bumps far too frequently to ever have a shared version" },
+]
 
 
 [licenses]
 private = { ignore = true }
-unlicensed = "deny"
-allow-osi-fsf-free = "neither"
 confidence-threshold = 0.92 # We want really high confidence when inferring licenses from text
-copyleft = "deny"
 allow = [
   "Apache-2.0 WITH LLVM-exception", # https://spdx.org/licenses/LLVM-exception.html
   "Apache-2.0",                     # https://tldrlegal.com/license/apache-license-2.0-(apache-2.0)
