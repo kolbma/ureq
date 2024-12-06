@@ -590,7 +590,7 @@ mod tests {
 
     #[test]
     fn send_byte_slice() {
-        let bytes = vec![1, 2, 3];
+        let bytes = [1, 2, 3];
         crate::agent()
             .post("http://example.com")
             .send(&bytes[1..2])
