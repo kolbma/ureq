@@ -2,6 +2,39 @@
 
 # {{crate}}
 
+<div align="center">
+  <!-- Version -->
+  <a href="https://crates.io/crates/ureq">
+    <img src="https://img.shields.io/crates/v/ureq.svg?style=flat-square"
+    alt="Crates.io version" />
+  </a>
+  <!-- Docs -->
+  <a href="https://docs.rs/ureq">
+    <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square"
+      alt="docs.rs docs" />
+  </a>
+  <!-- Downloads -->
+  <a href="https://crates.io/crates/ureq">
+    <img src="https://img.shields.io/crates/d/ureq.svg?style=flat-square"
+      alt="Crates.io downloads" />
+  </a>
+</div>
+
+> [!NOTE]  
+> * 2.12.x is MSRV 1.71
+> * 2.11.x is MSRV 1.67
+>
+> For both these lines, we will release patch version pinning dependencies as needed to
+> retain the MSRV. If we are bumping MSRV, that will require a minor version bump.
+>
+> [!NOTE]  
+> ureq version 2.11.0 was forced to bump MSRV from 1.63 -> 1.67.  
+> The problem is that the `time` crate 0.3.20, the last 1.63 compatible version, 
+> stopped compiling with Rust 
+> [1.80 and above](https://github.com/algesten/ureq/pull/878#issuecomment-2503176155).  
+> To release a 2.x version that is possible to compile on the latest Rust we were
+> forced to bump MSRV.
+
 {{readme}}
 
 [rustls]: https://docs.rs/rustls/
