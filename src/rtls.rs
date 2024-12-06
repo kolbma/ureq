@@ -64,12 +64,12 @@ fn root_certs() -> rustls::RootCertStore {
     use log::error;
 
     let mut root_cert_store = rustls::RootCertStore::empty();
-    let native_certs = rustls_native_certs::load_native_certs().unwrap_or_else(|e| {
+    let native_certs_result = rustls_native_certs::load_native_certs();
+    for e in native_certs_result.errors {
         error!("loading native certificates: {}", e);
-        vec![]
-    });
-    let (valid_count, invalid_count) =
-        root_cert_store.add_parsable_certificates(native_certs.into_iter().map(|c| c.into()));
+    }
+    let (valid_count, invalid_count) = root_cert_store
+        .add_parsable_certificates(native_certs_result.certs.into_iter().map(|c| c.into()));
     if valid_count == 0 && invalid_count > 0 {
         error!(
             "no valid certificates loaded by rustls-native-certs. all HTTPS requests will fail."
