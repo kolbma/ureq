@@ -26,7 +26,7 @@
 >
 > For both these lines, we will release patch version pinning dependencies as needed to
 > retain the MSRV. If we are bumping MSRV, that will require a minor version bump.
->
+
 > [!NOTE]  
 > ureq version 2.11.0 was forced to bump MSRV from 1.63 -> 1.67.  
 > The problem is that the `time` crate 0.3.20, the last 1.63 compatible version, 
