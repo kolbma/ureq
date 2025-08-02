@@ -54,12 +54,13 @@ where
     fn read_chunk_size(&mut self) -> IoResult<usize> {
         let mut chunk_size_bytes = Vec::new();
         let mut has_ext = false;
+        let mut byte = [0u8; 1];
 
         loop {
-            let byte = match self.source.by_ref().bytes().next() {
-                Some(b) => b?,
-                None => return Err(IoError::new(ErrorKind::InvalidInput, DecoderError)),
-            };
+            if self.source.by_ref().read(&mut byte)? == 0 {
+                return Err(IoError::new(ErrorKind::InvalidInput, DecoderError));
+            }
+            let byte = byte[0];
 
             if byte == b'\r' {
                 break;
@@ -76,11 +77,7 @@ where
         // Ignore extensions for now
         if has_ext {
             loop {
-                let byte = match self.source.by_ref().bytes().next() {
-                    Some(b) => b?,
-                    None => return Err(IoError::new(ErrorKind::InvalidInput, DecoderError)),
-                };
-                if byte == b'\r' {
+                if self.read_carriage_return().is_ok() {
                     break;
                 }
             }
@@ -97,45 +94,58 @@ where
     }
 
     fn read_carriage_return(&mut self) -> IoResult<()> {
-        match self.source.by_ref().bytes().next() {
-            Some(Ok(b'\r')) => Ok(()),
-            _ => Err(IoError::new(ErrorKind::InvalidInput, DecoderError)),
+        let mut byte = [0u8; 1];
+        if self.source.by_ref().read(&mut byte)? == 0 {
+            return Err(IoError::new(ErrorKind::InvalidInput, DecoderError));
+        }
+        let byte = byte[0];
+        if byte == b'\r' {
+            Ok(())
+        } else {
+            Err(IoError::new(ErrorKind::InvalidInput, DecoderError))
         }
     }
 
     fn read_line_feed(&mut self) -> IoResult<()> {
-        match self.source.by_ref().bytes().next() {
-            Some(Ok(b'\n')) => Ok(()),
-            _ => Err(IoError::new(ErrorKind::InvalidInput, DecoderError)),
+        let mut byte = [0u8; 1];
+        if self.source.by_ref().read(&mut byte)? == 0 {
+            return Err(IoError::new(ErrorKind::InvalidInput, DecoderError));
+        }
+        let byte = byte[0];
+        if byte == b'\n' {
+            Ok(())
+        } else {
+            Err(IoError::new(ErrorKind::InvalidInput, DecoderError))
         }
     }
 
     // Sometimes the last \r\n is missing.
     fn read_end(&mut self) -> IoResult<()> {
-        fn expect_or_end(
-            bytes: &mut impl Iterator<Item = IoResult<u8>>,
-            expected: u8,
-        ) -> IoResult<()> {
-            match bytes.next() {
-                Some(Ok(c)) => {
-                    if c == expected {
+        fn expect_or_end(mut r: impl Read, expected: u8) -> IoResult<()> {
+            let mut byte = [0u8; 1];
+
+            match r.read(&mut byte) {
+                Ok(1..) => {
+                    if byte[0] == expected {
                         Ok(())
                     } else {
                         Err(IoError::new(ErrorKind::InvalidInput, DecoderError))
                     }
                 }
-                Some(Err(e)) => {
+                Ok(0) => {
+                    Ok(()) // end of stream is ok
+                }
+                Err(e) => {
                     match e.kind() {
                         // Closed connections are ok.
                         ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => Ok(()),
                         _ => Err(IoError::new(ErrorKind::InvalidInput, DecoderError)),
                     }
                 }
-                None => Ok(()), // End of iterator is ok
             }
         }
 
-        let mut bytes = self.source.by_ref().bytes();
+        let mut bytes = self.source.by_ref();
 
         expect_or_end(&mut bytes, b'\r')?;
         expect_or_end(&mut bytes, b'\n')?;
