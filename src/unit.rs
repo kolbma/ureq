@@ -51,7 +51,7 @@ impl Unit {
             // if the user has set an encoding header, obey that.
             .map(|enc| {
                 let is_transfer_encoding_set = !enc.is_empty();
-                let last_encoding = enc.split(',').last();
+                let last_encoding = enc.split(',').next_back();
                 let is_chunked = last_encoding
                     .map(|last_enc| last_enc.trim() == "chunked")
                     .unwrap_or(false);
