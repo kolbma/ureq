@@ -77,7 +77,7 @@ where
         // Ignore extensions for now
         if has_ext {
             loop {
-                if self.read_carriage_return().is_ok() {
+                if self.read_carriage_return()? {
                     break;
                 }
             }
@@ -93,17 +93,13 @@ where
         Ok(chunk_size)
     }
 
-    fn read_carriage_return(&mut self) -> IoResult<()> {
+    fn read_carriage_return(&mut self) -> IoResult<bool> {
         let mut byte = [0u8; 1];
         if self.source.by_ref().read(&mut byte)? == 0 {
             return Err(IoError::new(ErrorKind::InvalidInput, DecoderError));
         }
         let byte = byte[0];
-        if byte == b'\r' {
-            Ok(())
-        } else {
-            Err(IoError::new(ErrorKind::InvalidInput, DecoderError))
-        }
+        Ok(byte == b'\r')
     }
 
     fn read_line_feed(&mut self) -> IoResult<()> {
@@ -192,7 +188,9 @@ where
         let read = self.source.read(buf)?;
 
         self.remaining_chunks_size = if read == remaining_chunks_size {
-            self.read_carriage_return()?;
+            if !self.read_carriage_return()? {
+                return Err(IoError::new(ErrorKind::InvalidInput, DecoderError));
+            }
             self.read_line_feed()?;
             None
         } else {
