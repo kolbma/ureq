@@ -27,7 +27,7 @@ pub fn main() -> Result<(), Box<Error>> {
     {
         let state = shared_state.lock().unwrap();
 
-        println!("State after requests:\n\n{:?}\n", state);
+        println!("State after requests:\n\n{state:?}\n");
 
         assert_eq!(state.request_count, 2);
         assert_eq!(state.total_bytes, 246);

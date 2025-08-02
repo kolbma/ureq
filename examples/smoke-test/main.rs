@@ -40,10 +40,10 @@ fn get(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>> {
 }
 
 fn get_and_write(agent: &ureq::Agent, url: &str) {
-    info!("🕷️ {}", url);
+    info!("🕷️ {url}");
     match get(agent, url) {
-        Ok(_) => info!("✔️ {}", url),
-        Err(e) => error!("⚠️ {} {}", url, e),
+        Ok(_) => info!("✔️ {url}"),
+        Err(e) => error!("⚠️ {url} {e}"),
     }
 }
 
@@ -70,7 +70,7 @@ fn get_many(urls: Vec<String>, simultaneous_fetches: usize) -> Result<()> {
         }));
     }
     for h in join_handles {
-        h.join().map_err(|e| Oops(format!("{:?}", e)))?;
+        h.join().map_err(|e| Oops(format!("{e:?}")))?;
     }
     Ok(())
 }
@@ -98,10 +98,10 @@ using 50 threads concurrently.
     let mut urls = vec![];
     for line in bufreader.lines() {
         let domain = line?.rsplit(',').next().unwrap().to_string();
-        urls.push(format!("http://{}/", domain));
-        urls.push(format!("https://{}/", domain));
-        urls.push(format!("http://www.{}/", domain));
-        urls.push(format!("https://www.{}/", domain));
+        urls.push(format!("http://{domain}/"));
+        urls.push(format!("https://{domain}/"));
+        urls.push(format!("http://www.{domain}/"));
+        urls.push(format!("https://www.{domain}/"));
     }
     get_many(urls, 50)?;
     Ok(())

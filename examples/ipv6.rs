@@ -30,7 +30,7 @@ pub fn main() {
 
     match result {
         Err(err) => {
-            println!("{:?}", err);
+            println!("{err:?}");
             std::process::exit(1);
         }
         Ok(response) => {
