@@ -125,7 +125,7 @@ where
             let mut byte = [0u8; 1];
 
             match r.read(&mut byte) {
-                Ok(1..) => {
+                Ok(1) => {
                     if byte[0] == expected {
                         Ok(())
                     } else {
@@ -135,6 +135,7 @@ where
                 Ok(0) => {
                     Ok(()) // end of stream is ok
                 }
+                Ok(_) => Err(IoError::new(ErrorKind::InvalidData, "Unexpected read size")),
                 Err(e) => {
                     match e.kind() {
                         // Closed connections are ok.
