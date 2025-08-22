@@ -179,8 +179,8 @@ pub trait OrAnyStatus {
     /// of status code.
     ///
     /// ```
-    /// # ureq::is_test(true);
     /// # fn main() -> Result<(), ureq::Transport> {
+    /// # ureq::is_test(true);
     /// // Bring trait into context.
     /// use ureq::OrAnyStatus;
     ///
